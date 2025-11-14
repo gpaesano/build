@@ -15,7 +15,7 @@
 		gpios = <&gpio2 RK_PD2 GPIO_ACTIVE_LOW>;
 		linux,default-trigger = "timer";
 	};
- ir-led {
+        ir-led {
                 label = "ir-led";
                 gpios = <&gpio2 RK_PC2 GPIO_ACTIVE_HIGH>;
                 linux,default-trigger = "heartbeat";
