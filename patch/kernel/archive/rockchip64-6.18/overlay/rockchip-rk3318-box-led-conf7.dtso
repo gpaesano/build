@@ -23,7 +23,7 @@
 		#size-cells = <0>;
 
 		display@24 {
-			compatible = "fdhisi,fd655";
+			compatible = "fdhisi,fd6551"; /* it is a fd6551 - 8 levels of brightness are available */
 			reg = <0x24>;
 
 			digits {
