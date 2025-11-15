@@ -6,7 +6,7 @@
 #include <dt-bindings/pinctrl/rockchip.h>
 
 /**
- * T9_RK3318 (T9 Sunwell 3318)
+ * T9_RK3328 (T9 Sunwell 3328)
  */
 
 &{/} {
