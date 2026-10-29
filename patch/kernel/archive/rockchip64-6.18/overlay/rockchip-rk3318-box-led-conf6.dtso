@@ -91,6 +91,7 @@
 				led@3,7 {
 					reg = <3 7>;
 					function = LED_FUNCTION_WLAN;
+/*
 					linux,default-trigger = "mmc1";
 
 				};
