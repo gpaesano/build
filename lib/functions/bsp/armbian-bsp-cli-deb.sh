@@ -127,6 +127,19 @@ function compile_armbian-bsp-cli() {
 	run_host_command_logged rsync -av "${SRC}"/packages/bsp/common/* "${destination}"
 	wait_for_disk_sync "after rsync'ing package/bsp/common for bsp-cli"
 
+	# Optional: park SATA/HDD heads on shutdown. Opt-in per board or family with
+	# HDD_PARK_ON_SHUTDOWN="yes". The generic script syncs, waits for any mdadm
+	# array to go clean, then spins down (hdparm -y) and detaches every
+	# /sys/block/sd*, so NAS-style boards (Odroid HC4/XU4, and any of the many
+	# SATA-capable boards) avoid violent emergency head retracts on power-off.
+	# The script itself skips reboot/kexec. (Not under packages/bsp/common, which
+	# is rsynced to every image unconditionally - this must only install on opt-in.)
+	if [[ "${HDD_PARK_ON_SHUTDOWN}" == "yes" ]]; then
+		display_alert "Installing SATA park-on-shutdown hook" "${BOARD}" "info"
+		mkdir -p "${destination}"/lib/systemd/system-shutdown
+		install -m 0755 "${SRC}"/packages/bsp/park-sata-disks.shutdown "${destination}"/lib/systemd/system-shutdown/park-sata-disks.shutdown
+	fi
+
 	mkdir -p "${destination}"/usr/share/armbian/
 
 	# get bootscript information.
@@ -179,10 +192,6 @@ function compile_armbian-bsp-cli() {
 	# TODO: Add proper handling for updated conffiles
 	# We are runing this script each time apt runs. If this package is removed, file is removed and error is triggered.
 	# Keeping armbian-apt-updates as a configuration, solve the problem
-	cat <<- EOF > "${destination}"/DEBIAN/conffiles
-		/usr/lib/armbian/armbian-apt-updates
-		/etc/X11/xorg.conf.d/01-armbian-defaults.conf
-	EOF
 
 	# trigger uInitrd creation after installation, to apply
 	# /etc/initramfs/post-update.d/99-uboot
@@ -212,6 +221,27 @@ function compile_armbian-bsp-cli() {
 		You can also append to the `preinst_functions`, `postinst_functions` and `postrm` array, and the _content_
 		of those functions will be added to the preinst, postinst and postrm scripts respectively.
 	POST_FAMILY_TWEAKS_BSP
+
+	# Conffiles, after the hooks: family_tweaks_bsp, post_family_tweaks_bsp and the
+	# extensions all write to $destination, so the tree is only final here.
+	#
+	# List a path only when the package really contains it. Extensions strip BSP
+	# files on purpose -- a cloud image has no use for the apt periodic config, for
+	# instance -- and the framework cannot know which. A listed path that is not in
+	# the tree makes dpkg-deb refuse: "does not appear in package".
+	declare -a bsp_conffile_candidates=(
+		"/usr/lib/armbian/armbian-apt-updates"
+		"/etc/X11/xorg.conf.d/01-armbian-defaults.conf"
+	)
+	declare bsp_conffile
+	: > "${destination}"/DEBIAN/conffiles
+	for bsp_conffile in "${bsp_conffile_candidates[@]}"; do
+		if [[ -f "${destination}${bsp_conffile}" ]]; then
+			echo "${bsp_conffile}" >> "${destination}"/DEBIAN/conffiles
+		else
+			display_alert "Not shipping conffile, removed from the BSP" "${bsp_conffile}" "debug"
+		fi
+	done
 
 	# Render the postinst/postrm/etc
 	# set up pre install script; use inline functions
@@ -260,15 +290,20 @@ function reversion_armbian-bsp-cli_deb_contents() {
 	# Depends: linux-base is needed for "linux-version" command in initrd cleanup script
 	# Depends: fping is needed for armbianmonitor to upload armbian-hardware-monitor.log
 	# Depends: base-files (>= ${REVISION}) is to force usage of our base-files package (not the original Distro's).
+	# Depends: ${EXTRA_BSPDEPS} — opt-in slot for family/board-specific runtime deb-Depends.
+	#         Use this (not PACKAGE_LIST_BOARD) when configure-ordering matters:
+	#         only deb-Depends guarantees the dep is configured before this BSP's postinst runs.
 	declare depends_base_files=", base-files (>= ${REVISION})"
 	if [[ "${KEEP_ORIGINAL_OS_RELEASE:-"no"}" == "yes" ]]; then
 		depends_base_files=""
 	fi
+	# The BSP ships 55-bsp-default.conf after the distro defaults.
+	# It provides linux-sysctl-defaults without replacing the distro package.
 	cat <<- EOF >> "${control_file_new}"
-		Depends: bash, linux-base, u-boot-tools, initramfs-tools, lsb-release, fping, device-tree-compiler${depends_base_files}
+		Depends: bash, linux-base, u-boot-tools, initramfs-tools, lsb-release, fping, device-tree-compiler${depends_base_files}${EXTRA_BSPDEPS:+, ${EXTRA_BSPDEPS}}
 		Replaces: zram-config, armbian-bsp-cli-${BOARD}${EXTRA_BSP_NAME} (<< ${REVISION})
 		Breaks: armbian-bsp-cli-${BOARD}${EXTRA_BSP_NAME} (<< ${REVISION})
-		Provides: armbian-bsp-cli
+		Provides: armbian-bsp-cli, linux-sysctl-defaults
 	EOF
 
 	artifact_deb_reversion_unpack_data_deb
@@ -278,6 +313,11 @@ function reversion_armbian-bsp-cli_deb_contents() {
 		VERSION=${REVISION}
 		REVISION=$REVISION
 	EOF
+	if [[ -f "${control_dir}/md5sums" ]]; then
+		local release_checksum
+		release_checksum=$(md5sum "${data_dir}/etc/armbian-release")
+		sed -i "s|^[[:xdigit:]]\{32\}  etc/armbian-release$|${release_checksum%% *}  etc/armbian-release|" "${control_dir}/md5sums"
+	fi
 
 	# Show results if debugging
 	if [[ "${SHOW_DEBUG}" == "yes" ]]; then
@@ -305,7 +345,7 @@ function get_bootscript_info() {
 		bootscript_info[bootscript_file_contents]=""
 
 		bootscript_info[bootscript_file_fullpath]="${SRC}/config/bootscripts/${bootscript_source}"
-		if [ -f "${USERPATCHES_PATH}/bootscripts/${bootscript_source}" ]; then
+		if [[ -f "${USERPATCHES_PATH}/bootscripts/${bootscript_source}" ]]; then
 			bootscript_info[bootscript_file_fullpath]="${USERPATCHES_PATH}/bootscripts/${bootscript_source}"
 		fi
 		bootscript_info[bootscript_file_contents]="$(cat "${bootscript_info[bootscript_file_fullpath]}")"
@@ -329,8 +369,8 @@ function get_bootscript_info() {
 function board_side_bsp_cli_postinst_update_uboot_bootscript() {
 	if [[ ${BOOTSCRIPT_FORCE_UPDATE} == yes || ! -f /boot/${BOOTSCRIPT_DST} ]]; then
 
-		[ -z ${BOOTSCRIPT_BACKUP_VERSION} ] && BOOTSCRIPT_BACKUP_VERSION="$(date +%s)"
-		if [ -f /boot/${BOOTSCRIPT_DST} ]; then
+		[[ -z "${BOOTSCRIPT_BACKUP_VERSION}" ]] && BOOTSCRIPT_BACKUP_VERSION="$(date +%s)"
+		if [[ -f "/boot/${BOOTSCRIPT_DST}" ]]; then
 			cp -v /boot/${BOOTSCRIPT_DST} /usr/share/armbian/${BOOTSCRIPT_DST}-${BOOTSCRIPT_BACKUP_VERSION}
 			echo "NOTE: You can find previous bootscript versions in /usr/share/armbian !"
 		fi
@@ -341,23 +381,23 @@ function board_side_bsp_cli_postinst_update_uboot_bootscript() {
 		rootfstype=$(sed -e 's/^.*rootfstype=//' -e 's/ .*$//' < /proc/cmdline)
 
 		# recreate armbianEnv.txt if it and extlinux does not exists
-		if [ ! -f /boot/armbianEnv.txt ] && [ ! -f /boot/extlinux/extlinux.conf ]; then
+		if [[ ! -f /boot/armbianEnv.txt && ! -f /boot/extlinux/extlinux.conf ]]; then
 			cp -v /usr/share/armbian/armbianEnv.txt /boot
 			echo "rootdev="\$rootdev >> /boot/armbianEnv.txt
 			echo "rootfstype="\$rootfstype >> /boot/armbianEnv.txt
 		fi
 
 		# update boot.ini if it exists? @TODO: why? who uses this?
-		[ -f /boot/boot.ini ] && sed -i "s/setenv rootdev.*/setenv rootdev \\"$rootdev\\"/" /boot/boot.ini
-		[ -f /boot/boot.ini ] && sed -i "s/setenv rootfstype.*/setenv rootfstype \\"$rootfstype\\"/" /boot/boot.ini
+		[[ -f /boot/boot.ini ]] && sed -i "s/setenv rootdev.*/setenv rootdev \\"$rootdev\\"/" /boot/boot.ini
+		[[ -f /boot/boot.ini ]] && sed -i "s/setenv rootfstype.*/setenv rootfstype \\"$rootfstype\\"/" /boot/boot.ini
 
-		[ -f /boot/boot.cmd ] && mkimage -C none -A arm -T script -d /boot/boot.cmd /boot/boot.scr > /dev/null 2>&1
+		[[ -f /boot/boot.cmd ]] && mkimage -C none -A arm -T script -d /boot/boot.cmd /boot/boot.scr > /dev/null 2>&1
 	fi
 }
 
 function board_side_bsp_cli_preinst() {
 	# tell people to reboot at next login
-	[ "$1" = "upgrade" ] && touch /var/run/.reboot_required
+	[[ "$1" == "upgrade" ]] && touch /var/run/.reboot_required
 
 	# fixing ramdisk corruption when using lz4 compression method
 	sed -i "s/^COMPRESS=.*/COMPRESS=gzip/" /etc/initramfs-tools/initramfs.conf
@@ -372,41 +412,62 @@ function board_side_bsp_cli_preinst() {
 			echo vm.swappiness=100 >> /etc/sysctl.conf
 			;;
 	esac
-	sysctl -p > /dev/null 2>&1
+	# --system (not -p) so the change to /etc/sysctl.conf above *and* the
+	# drop-ins under /usr/lib/sysctl.d (our 55-bsp-default.conf) are applied on
+	# upgrade; -p reads only /etc/sysctl.conf and would leave them to next boot.
+	sysctl --system > /dev/null 2>&1
 	# replace canonical advertisement
-	if [ -d "/var/lib/ubuntu-advantage/messages/" ]; then
+	if [[ -d "/var/lib/ubuntu-advantage/messages/" ]]; then
 		echo -e "\nSupport Armbian! \nLearn more at https://armbian.com/donate" > /var/lib/ubuntu-advantage/messages/apt-pre-invoke-esm-service-status
 		cp /var/lib/ubuntu-advantage/messages/apt-pre-invoke-esm-service-status /var/lib/ubuntu-advantage/messages/apt-pre-invoke-no-packages-apps.tmpl
 		cp /var/lib/ubuntu-advantage/messages/apt-pre-invoke-esm-service-status /var/lib/ubuntu-advantage/messages/apt-pre-invoke-packages-apps
 		cp /var/lib/ubuntu-advantage/messages/apt-pre-invoke-esm-service-status /var/lib/ubuntu-advantage/messages/apt-pre-invoke-packages-apps.tmpl
 	fi
 	# disable deprecated services
-	[ -f "/etc/profile.d/activate_psd_user.sh" ] && rm /etc/profile.d/activate_psd_user.sh
-	[ -f "/etc/profile.d/check_first_login.sh" ] && rm /etc/profile.d/check_first_login.sh
-	[ -f "/etc/profile.d/check_first_login_reboot.sh" ] && rm /etc/profile.d/check_first_login_reboot.sh
-	[ -f "/etc/profile.d/ssh-title.sh" ] && rm /etc/profile.d/ssh-title.sh
-	[ -f "/etc/update-motd.d/10-header" ] && rm /etc/update-motd.d/10-header
-	[ -f "/etc/update-motd.d/30-sysinfo" ] && rm /etc/update-motd.d/30-sysinfo
-	[ -f "/etc/update-motd.d/35-tips" ] && rm /etc/update-motd.d/35-tips
-	[ -f "/etc/update-motd.d/40-updates" ] && rm /etc/update-motd.d/40-updates
-	[ -f "/etc/update-motd.d/98-autoreboot-warn" ] && rm /etc/update-motd.d/98-autoreboot-warn
-	[ -f "/etc/update-motd.d/99-point-to-faq" ] && rm /etc/update-motd.d/99-point-to-faq
-	[ -f "/etc/update-motd.d/80-esm" ] && rm /etc/update-motd.d/80-esm
-	[ -f "/etc/update-motd.d/80-livepatch" ] && rm /etc/update-motd.d/80-livepatch
-	[ -f "/etc/apt/apt.conf.d/02compress-indexes" ] && rm /etc/apt/apt.conf.d/02compress-indexes
-	[ -f "/etc/apt/apt.conf.d/02periodic" ] && rm /etc/apt/apt.conf.d/02periodic
-	[ -f "/etc/apt/apt.conf.d/no-languages" ] && rm /etc/apt/apt.conf.d/no-languages
-	[ -f "/etc/init.d/armhwinfo" ] && rm /etc/init.d/armhwinfo
-	[ -f "/etc/logrotate.d/armhwinfo" ] && rm /etc/logrotate.d/armhwinfo
-	[ -f "/etc/init.d/firstrun" ] && rm /etc/init.d/firstrun
-	[ -f "/etc/init.d/resize2fs" ] && rm /etc/init.d/resize2fs
-	[ -f "/lib/systemd/system/firstrun-config.service" ] && rm /lib/systemd/system/firstrun-config.service
-	[ -f "/lib/systemd/system/firstrun.service" ] && rm /lib/systemd/system/firstrun.service
-	[ -f "/lib/systemd/system/resize2fs.service" ] && rm /lib/systemd/system/resize2fs.service
-	[ -f "/usr/lib/armbian/apt-updates" ] && rm /usr/lib/armbian/apt-updates
-	[ -f "/usr/lib/armbian/firstrun-config.sh" ] && rm /usr/lib/armbian/firstrun-config.sh
+	[[ -f "/etc/profile.d/activate_psd_user.sh" ]] && rm /etc/profile.d/activate_psd_user.sh
+	[[ -f "/etc/profile.d/check_first_login.sh" ]] && rm /etc/profile.d/check_first_login.sh
+	[[ -f "/etc/profile.d/check_first_login_reboot.sh" ]] && rm /etc/profile.d/check_first_login_reboot.sh
+	[[ -f "/etc/profile.d/ssh-title.sh" ]] && rm /etc/profile.d/ssh-title.sh
+	[[ -f "/etc/update-motd.d/10-header" ]] && rm /etc/update-motd.d/10-header
+	[[ -f "/etc/update-motd.d/30-sysinfo" ]] && rm /etc/update-motd.d/30-sysinfo
+	[[ -f "/etc/update-motd.d/35-tips" ]] && rm /etc/update-motd.d/35-tips
+	[[ -f "/etc/update-motd.d/40-updates" ]] && rm /etc/update-motd.d/40-updates
+	[[ -f "/etc/update-motd.d/98-autoreboot-warn" ]] && rm /etc/update-motd.d/98-autoreboot-warn
+	[[ -f "/etc/update-motd.d/99-point-to-faq" ]] && rm /etc/update-motd.d/99-point-to-faq
+	[[ -f "/etc/update-motd.d/80-esm" ]] && rm /etc/update-motd.d/80-esm
+	[[ -f "/etc/update-motd.d/80-livepatch" ]] && rm /etc/update-motd.d/80-livepatch
+	[[ -f "/etc/apt/apt.conf.d/02compress-indexes" ]] && rm /etc/apt/apt.conf.d/02compress-indexes
+	[[ -f "/etc/apt/apt.conf.d/02periodic" ]] && rm /etc/apt/apt.conf.d/02periodic
+	# automatic-update policy now lives only in armbian-config. Migrate systems off
+	# the BSP's periodic config, once: only while 02-armbian-periodic is still present.
+	# It set APT::Periodic::Enable "0", the master off-switch; with it gone,
+	# apt.systemd.daily defaults Enable to 1. So read the effective value BEFORE
+	# removing it (apt-config reads merged config, so a commented setting cannot count),
+	# then drop the stock unattended-upgrades trigger unless updates are enabled.
+	# armbian-config writes APT::Periodic::Enable "1" when a user opts in, so that case
+	# is preserved. Gating on the file means a later dpkg-reconfigure is left untouched.
+	if [[ -f "/etc/apt/apt.conf.d/02-armbian-periodic" ]]; then
+		if [[ "$(apt-config dump --format '%v%n' APT::Periodic::Enable 2>/dev/null)" != "1" ]]; then
+			# clear the debconf answer too, so a later unattended-upgrades postinst
+			# cannot recreate 20auto-upgrades with updates on
+			command -v debconf-set-selections >/dev/null 2>&1 && \
+				echo "unattended-upgrades unattended-upgrades/enable_auto_updates boolean false" | debconf-set-selections
+			rm -f /etc/apt/apt.conf.d/20auto-upgrades
+		fi
+		rm /etc/apt/apt.conf.d/02-armbian-periodic
+	fi
+	[[ -f "/etc/apt/apt.conf.d/no-languages" ]] && rm /etc/apt/apt.conf.d/no-languages
+	[[ -f "/etc/init.d/armhwinfo" ]] && rm /etc/init.d/armhwinfo
+	[[ -f "/etc/logrotate.d/armhwinfo" ]] && rm /etc/logrotate.d/armhwinfo
+	[[ -f "/etc/init.d/firstrun" ]] && rm /etc/init.d/firstrun
+	[[ -f "/etc/init.d/resize2fs" ]] && rm /etc/init.d/resize2fs
+	[[ -f "/lib/systemd/system/firstrun-config.service" ]] && rm /lib/systemd/system/firstrun-config.service
+	[[ -f "/lib/systemd/system/firstrun.service" ]] && rm /lib/systemd/system/firstrun.service
+	[[ -f "/lib/systemd/system/resize2fs.service" ]] && rm /lib/systemd/system/resize2fs.service
+	[[ -f "/usr/lib/armbian/apt-updates" ]] && rm /usr/lib/armbian/apt-updates
+	[[ -f "/usr/lib/armbian/firstrun-config.sh" ]] && rm /usr/lib/armbian/firstrun-config.sh
 	# fix for https://bugs.launchpad.net/ubuntu/+source/lightdm-gtk-greeter/+bug/1897491
-	[ -d "/var/lib/lightdm" ] && (
+	[[ -d "/var/lib/lightdm" ]] && (
 		chown -R lightdm:lightdm /var/lib/lightdm
 		chmod 0750 /var/lib/lightdm
 	)
@@ -423,20 +484,20 @@ function board_side_bsp_cli_postrm() { # not run here
 function board_side_bsp_cli_postinst_base() {
 	# Source the armbian-release information file
 	# shellcheck source=/dev/null
-	[ -f /etc/armbian-release ] && . /etc/armbian-release
+	[[ -f /etc/armbian-release ]] && . /etc/armbian-release
 
 	# ARMBIAN_PRETTY_NAME is now set in armbian-base-files.
 
 	# Force ramlog to be enabled if it exists. @TODO: why?
-	[ -f /etc/lib/systemd/system/armbian-ramlog.service ] && systemctl --no-reload enable armbian-ramlog.service
+	[[ -f /etc/lib/systemd/system/armbian-ramlog.service ]] && systemctl --no-reload enable armbian-ramlog.service
 
 	# check if it was disabled in config and disable in new service
-	if [ -n "$(grep -w '^ENABLED=false' /etc/default/log2ram 2> /dev/null)" ]; then
+	if [[ -n "$(grep -w '^ENABLED=false' /etc/default/log2ram 2> /dev/null)" ]]; then
 		sed -i "s/^ENABLED=.*/ENABLED=false/" /etc/default/armbian-ramlog
 	fi
 
 	# fix boot delay "waiting for suspend/resume device"
-	if [ -f "/etc/initramfs-tools/initramfs.conf" ]; then
+	if [[ -f "/etc/initramfs-tools/initramfs.conf" ]]; then
 		if ! grep --quiet "RESUME=none" /etc/initramfs-tools/initramfs.conf; then
 			echo "RESUME=none" >> /etc/initramfs-tools/initramfs.conf
 		fi
@@ -447,21 +508,33 @@ function board_side_bsp_cli_postinst_finish() {
 	ln -sf /var/run/motd /etc/motd
 	rm -f /etc/update-motd.d/00-header /etc/update-motd.d/10-help-text
 
-	if [ ! -f "/etc/default/armbian-motd" ]; then
+	if [[ ! -f "/etc/default/armbian-motd" ]]; then
 		mv /etc/default/armbian-motd.dpkg-dist /etc/default/armbian-motd
 	fi
-	if [ ! -f "/etc/default/armbian-ramlog" ] && [ -f /etc/default/armbian-ramlog.dpkg-dist ]; then
+	if [[ ! -f "/etc/default/armbian-ramlog" && -f /etc/default/armbian-ramlog.dpkg-dist ]]; then
 		mv /etc/default/armbian-ramlog.dpkg-dist /etc/default/armbian-ramlog
 	fi
-	if [ ! -f "/etc/default/armbian-zram-config" ] && [ -f /etc/default/armbian-zram-config.dpkg-dist ]; then
+	if [[ ! -f "/etc/default/armbian-zram-config" && -f /etc/default/armbian-zram-config.dpkg-dist ]]; then
 		mv /etc/default/armbian-zram-config.dpkg-dist /etc/default/armbian-zram-config
 	fi
-	if [ ! -f "/etc/default/armbian-firstrun" ]; then
+	if [[ ! -f "/etc/default/armbian-firstrun" ]]; then
 		mv /etc/default/armbian-firstrun.dpkg-dist /etc/default/armbian-firstrun
 	fi
-
-	if [ -L "/usr/lib/chromium-browser/master_preferences.dpkg-dist" ]; then
-		mv /usr/lib/chromium-browser/master_preferences.dpkg-dist /usr/lib/chromium-browser/master_preferences
+	# Groups that every new normal user joins: hardware and desktop access.
+	# armbian-firstlogin adds the first user to these and to the admin groups.
+	armbian_user_groups="audio video plugdev input dialout netdev bluetooth render users games i2c gpio spi"
+	# Create missing groups. This changes no user. udev rules use i2c, gpio and spi.
+	for group in ${armbian_user_groups} docker; do
+		getent group "${group}" > /dev/null || groupadd --system "${group}" || echo "Warning: Failed to create group ${group}" >&2
+	done
+	# First install only (also the image build): adduser adds new normal users to these groups.
+	# Not GROUPS= in /etc/default/useradd: useradd also applies it to system accounts.
+	# Upgrades keep the local defaults and the groups of existing users.
+	if [[ -z "$2" ]]; then
+		if [[ -f /etc/adduser.conf ]]; then
+			sed -i -e '/^#\?ADD_EXTRA_GROUPS=/d' -e '/^#\?EXTRA_GROUPS=/d' /etc/adduser.conf
+			printf 'ADD_EXTRA_GROUPS=1\nEXTRA_GROUPS="%s"\n' "${armbian_user_groups}" >> /etc/adduser.conf
+		fi
 	fi
 
 	# Reload services
