@@ -3,10 +3,10 @@ BOARD_NAME="Turing RK1"
 BOARD_VENDOR="rockchip"
 BOARDFAMILY="rockchip-rk3588"
 BOARD_MAINTAINER=""
+INTRODUCED="2024"
 BOOTCONFIG="turing-rk1-rk3588_defconfig"
-BOOT_SOC="rk3588"
 KERNEL_TARGET="current,edge,vendor"
-KERNEL_TEST_TARGET="vendor,current"
+KERNEL_TEST_TARGET="vendor"
 FULL_DESKTOP="yes"
 BOOT_LOGO="desktop"
 IMAGE_PARTITION_TABLE="gpt"
@@ -18,7 +18,7 @@ function post_family_config__turing-rk1_default_serial_console_by_branch() {
 	display_alert "$BOARD" "Declare serialcon for $BOARD / $BRANCH" "info"
 
 	case $BRANCH in
-		vendor)
+		vendor*)
 			declare -g SERIALCON="ttyS9"
 			;;
 		*)
@@ -33,7 +33,7 @@ function post_family_tweaks__turing-rk1_default_serial_console_by_branch() {
 	display_alert "$BOARD" "Modify bootscript serial console for $BOARD / $BRANCH" "info"
 
 	case $BRANCH in
-		vendor)
+		vendor*)
 			sed -i 's/console=ttyS2,1500000/console=ttyS9,115200/g' $SDCARD/boot/boot.cmd
 			;;
 		*)
@@ -50,8 +50,8 @@ function post_family_config__turing-rk1_use_mainline_uboot() {
 	display_alert "$BOARD" "Using mainline U-Boot for $BOARD / $BRANCH" "info"
 
 	declare -g BOOTSOURCE="https://github.com/u-boot/u-boot.git"
-	declare -g BOOTBRANCH='tag:v2024.04'
-	declare -g BOOTPATCHDIR="v2024.04"
+	declare -g BOOTBRANCH='tag:v2026.07'
+	declare -g BOOTPATCHDIR="v2026.07"
 	declare -g BOOTDELAY=1
 	# Don't set BOOTDIR, allow shared U-Boot source directory for disk space efficiency
 
