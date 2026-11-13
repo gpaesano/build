@@ -181,7 +181,7 @@ function do_main_configuration() {
 		if [[ -z $CRYPTROOT_PASSPHRASE ]] && [[ -z $CRYPTROOT_AUTOUNLOCK ]]; then # a passphrase is mandatory if rootfs encryption is enabled, unless CRYPTROOT_AUTOUNLOCK is wanted
 			exit_with_error "Root encryption is enabled but CRYPTROOT_PASSPHRASE or CRYPTROOT_AUTOUNLOCK is not set"
 		fi
-		[[ -z $CRYPTROOT_MAPPER ]] && CRYPTROOT_MAPPER="armbian-root" # TODO: fixed name can't be used for parallel image building (rpardini: ?)
+		[[ -z $CRYPTROOT_MAPPER ]] && CRYPTROOT_MAPPER="armbian-root" # Global to the host: parallel builds wait for it
 		[[ -z $CRYPTROOT_SSH_UNLOCK ]] && CRYPTROOT_SSH_UNLOCK=yes
 		[[ -z $CRYPTROOT_SSH_UNLOCK_PORT ]] && CRYPTROOT_SSH_UNLOCK_PORT=2022
 		# Default to pdkdf2, this used to be the default with cryptroot <= 2.0, however
@@ -349,6 +349,21 @@ function do_main_configuration() {
 		[[ $BUILD_DESKTOP != "no" ]] && exit_with_error "HAS_VIDEO_OUTPUT is set to no. So we shouldn't build desktop environment"
 	fi
 
+	# Kernel security fixes that stable does not carry yet, from armbian/cve. Off until proven reliable; KERNEL_CVE_PATCHES=yes enables them.
+	# Only for stable kernels of the series that armbian/cve publishes. Vendor trees (KERNELSOURCE set by the family) do not match.
+	# Other kernels do not load the extension, so their version does not change.
+	declare -g KERNEL_CVE_PATCHES="${KERNEL_CVE_PATCHES:-"no"}"
+	declare -g KERNEL_CVE_SERIES="${KERNEL_CVE_SERIES:-"6.18 7.3"}"
+	if [[ "${KERNEL_CVE_PATCHES}" == "yes" ]]; then
+		if [[ " ${KERNEL_CVE_SERIES} " != *" ${KERNEL_MAJOR_MINOR} "* ]]; then
+			display_alert "Kernel CVE fixes" "no CVE patches for kernel ${KERNEL_MAJOR_MINOR:-"unknown"}, only for ${KERNEL_CVE_SERIES}" "wrn"
+		elif [[ -n "${KERNELSOURCE}" && "${KERNELSOURCE}" != "${MAINLINE_KERNEL_SOURCE}" ]]; then
+			display_alert "Kernel CVE fixes" "no CVE patches for vendor kernel ${KERNELSOURCE}" "wrn"
+		else
+			enable_extension "kernel-cve-patches"
+		fi
+	fi
+
 	# Make NETWORKING_STACK read-only, as further changes would make the whole thing inconsistent.
 	# But only after family config to allow family to change it (post-family hooks CANNOT change NETWORKING_STACK since the hook is running after this).
 	# Individual networking extensions should _check_ this to make there's no spurious enablement.
@@ -399,6 +414,13 @@ function do_main_configuration() {
 	POST_FAMILY_CONFIG_PER_BRANCH
 	track_general_config_variables "after post_family_config_branch hooks"
 
+	# Put the board overlay prefixes (OVERLAY_PREFIX_BOARD) before the family prefixes.
+	# A prefix that matches no overlay in the kernel of the current BRANCH does no harm.
+	if [[ -n "${OVERLAY_PREFIX_BOARD}" ]]; then
+		declare -g OVERLAY_PREFIX="${OVERLAY_PREFIX_BOARD}${OVERLAY_PREFIX:+ ${OVERLAY_PREFIX}}"
+		display_alert "Overlay prefixes" "OVERLAY_PREFIX='${OVERLAY_PREFIX}'" "debug"
+	fi
+
 	# Lets make some variables readonly.
 	# We don't want anything changing them, it's exclusively for family config.
 	declare -g -r PACKAGE_LIST_FAMILY="${PACKAGE_LIST_FAMILY}"
@@ -414,7 +436,7 @@ function do_extra_configuration() {
 	[[ -z $BOOTPATCHDIR ]] && BOOTPATCHDIR="u-boot-$LINUXFAMILY" # @TODO move to hook
 	[[ -z $ATFPATCHDIR ]] && ATFPATCHDIR="atf-$LINUXFAMILY"
 
-	if [[ "$RELEASE" =~ ^(focal|jammy|noble|oracular|plucky|questing|resolute)$ ]]; then
+	if [[ "$RELEASE" =~ ^(noble|resolute)$ ]]; then
 		DISTRIBUTION="Ubuntu"
 	else
 		DISTRIBUTION="Debian"
@@ -500,7 +522,27 @@ function do_extra_configuration() {
 		APT_PROXY_ADDR="$(echo "${http_proxy:-${https_proxy:-${HTTP_PROXY:-${HTTPS_PROXY:-}}}}" | sed -E 's|https?://([^/]+).*|\1|')"
 		display_alert "Derived APT proxy address from proxy env vars" "${APT_PROXY_ADDR##*@}" "info"
 	fi
-	[[ -n "${APT_PROXY_ADDR}" ]] && display_alert "Using custom apt proxy address" "APT_PROXY_ADDR=${APT_PROXY_ADDR##*@}" "info"
+	# Unreachable proxy: download direct instead of failing every apt call.
+	# Not with MANAGE_ACNG=yes: that cache starts later, in prepare_host.
+	if [[ -n "${APT_PROXY_ADDR}" && "${MANAGE_ACNG}" != "yes" ]]; then
+		# apt gets http://${APT_PROXY_ADDR}: no port means 80. Probe the same port.
+		declare apt_proxy="${APT_PROXY_ADDR##*@}" apt_proxy_host="${APT_PROXY_ADDR##*@}" apt_proxy_port=80
+		if [[ "${apt_proxy}" =~ ^(.+):([0-9]+)$ ]]; then
+			apt_proxy_host="${BASH_REMATCH[1]}" apt_proxy_port="${BASH_REMATCH[2]}"
+		fi
+		apt_proxy_host="${apt_proxy_host#[}" apt_proxy_host="${apt_proxy_host%]}" # IPv6 [addr]
+		if timeout 2 bash -c "exec 3<>/dev/tcp/${apt_proxy_host}/${apt_proxy_port}" 2> /dev/null; then
+			display_alert "Using custom apt proxy address" "APT_PROXY_ADDR=${apt_proxy}" "info"
+		else
+			display_alert "Apt proxy unreachable, downloading direct" "${apt_proxy}" "wrn"
+			APT_PROXY_ADDR=""
+			# apt also reads these. Drop the ones that point to this proxy.
+			declare v
+			for v in http_proxy https_proxy HTTP_PROXY HTTPS_PROXY; do
+				[[ "${!v:-}" =~ [/@]"${apt_proxy}"([:/]|$) ]] && unset "${v}"
+			done
+		fi
+	fi
 
 	# @TODO: allow to run aggregation, for CONFIG_DEFS_ONLY? rootfs_aggregate_packages
 
